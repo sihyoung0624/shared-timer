@@ -424,6 +424,10 @@ PAGE_HOME = '''
 <!DOCTYPE html><html lang="ko"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>모두의 타이머 · 만들기</title>
+<meta name="description" content="링크·QR 하나로 다같이 보는 실시간 타이머">
+<meta property="og:title" content="모두의 타이머">
+<meta property="og:description" content="링크·QR 하나로 다같이 보는 실시간 타이머">
+<meta property="og:type" content="website">
 <style>
 * { box-sizing: border-box; }
 body { font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
@@ -575,6 +579,10 @@ TIMER_PAGE_TEMPLATE = '''
 <!DOCTYPE html><html lang="ko"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
 <title>모두의 타이머</title>
+<meta name="description" content="링크·QR 하나로 다같이 보는 실시간 타이머">
+<meta property="og:title" content="모두의 타이머">
+<meta property="og:description" content="링크·QR 하나로 다같이 보는 실시간 타이머">
+<meta property="og:type" content="website">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.5.4/socket.io.min.js"></script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
