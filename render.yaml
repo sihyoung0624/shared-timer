@@ -1,0 +1,21 @@
+# ==========================================================================
+# Render.com 배포 설정 (Blueprint)
+# - Render 에서 이 저장소를 연결하면 이 파일을 읽어 자동으로 설정합니다.
+# - 자세한 단계별 안내는 DEPLOY.md 를 참고하세요.
+# ==========================================================================
+services:
+  - type: web
+    name: shared-timer
+    runtime: python
+    plan: free                  # 무료 플랜 (15분 미사용 시 잠자기 → 첫 접속이 느릴 수 있음)
+    buildCommand: pip install -r requirements.txt
+    # [중요] 반드시 워커 1개(-w 1). 데이터가 메모리에 있어 여러 워커면 방이 공유되지 않음.
+    startCommand: gunicorn -k eventlet -w 1 app:app
+    envVars:
+      - key: SECRET_KEY
+        generateValue: true     # Render 가 안전한 무작위 비밀키를 자동 생성
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+      # 선택: 접속 허용 도메인을 좁히려면 주석을 풀고 본인 주소로 변경
+      # - key: CORS_ORIGINS
+      #   value: "https://shared-timer.onrender.com"
