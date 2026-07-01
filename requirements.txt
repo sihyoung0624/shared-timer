@@ -31,7 +31,8 @@ wsproto==1.3.2
 
 # --- 배포(인터넷 공개)용 운영 서버 ---
 # 로컬 Windows 개발에는 불필요(python app.py 로 충분).
-# 리눅스 호스팅(Render 등)에서 실행:  gunicorn -k eventlet -w 1 app:app
-# (버전은 호스팅 환경에 맞는 최신 안정판이 설치되도록 고정하지 않음)
-gunicorn
-eventlet
+# 리눅스 호스팅(Render 등)에서 실행:  gunicorn -k eventlet -w 1 --bind 0.0.0.0:$PORT app:app
+# [중요] gunicorn 과 eventlet 은 '서로 호환되는' 버전으로 고정해야 함.
+#   최신끼리는 eventlet 작업자를 못 찾는 충돌 사례가 있어 검증된 조합으로 고정.
+gunicorn==21.2.0
+eventlet==0.33.3
