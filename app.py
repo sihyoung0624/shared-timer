@@ -1,6 +1,6 @@
 """
 ==========================================================================
- 공유 타이머 v2.1 (같은 공간용 MVP)
+ 모두의 타이머 (Shared Timer)
 ==========================================================================
  목적: 같은 와이파이 안에서 여러 사람이 각자 노트북/폰으로
        동일한 카운트다운을 실시간으로 보는 타이머.
@@ -423,7 +423,7 @@ def render_timer_page(room_id, is_controller, token):
 PAGE_HOME = '''
 <!DOCTYPE html><html lang="ko"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>공유 타이머 만들기</title>
+<title>모두의 타이머 · 만들기</title>
 <style>
 * { box-sizing: border-box; }
 body { font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
@@ -452,8 +452,8 @@ button { width:100%;padding:14px;margin-top:24px;border:none;border-radius:10px;
 .qr-hint { font-size:12px;color:#0f172a;margin-top:10px;line-height:1.45; }
 </style></head><body>
 <div class="card">
- <h1>공유 타이머</h1>
- <div class="sub">같은 와이파이에서 모두가 함께 보는 타이머</div>
+ <h1>모두의 타이머</h1>
+ <div class="sub">링크·QR 하나로 다같이 보는 실시간 타이머</div>
  <label>시간 설정</label>
  <div class="time-row">
   <div><input type="number" id="minutes" value="5" min="0" max="1440">
@@ -574,7 +574,7 @@ CONTROLS_HTML = '''
 TIMER_PAGE_TEMPLATE = '''
 <!DOCTYPE html><html lang="ko"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
-<title>공유 타이머</title>
+<title>모두의 타이머</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.5.4/socket.io.min.js"></script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -825,7 +825,7 @@ if __name__ == '__main__':
     PORT = int(os.environ.get('PORT', 5050))
     ip = get_local_ip()
     print("=" * 60)
-    print("  공유 타이머 v2.1 시작됨")
+    print("  모두의 타이머 시작됨")
     print("=" * 60)
     print(f"  이 컴퓨터:         http://localhost:{PORT}")
     print(f"  같은 와이파이 기기: http://{ip}:{PORT}")
