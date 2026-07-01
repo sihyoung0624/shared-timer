@@ -10,7 +10,7 @@ services:
     plan: free                  # 무료 플랜 (15분 미사용 시 잠자기 → 첫 접속이 느릴 수 있음)
     buildCommand: pip install -r requirements.txt
     # [중요] 반드시 워커 1개(-w 1). 데이터가 메모리에 있어 여러 워커면 방이 공유되지 않음.
-    startCommand: gunicorn -k eventlet -w 1 app:app
+    startCommand: gunicorn -k eventlet -w 1 --bind 0.0.0.0:$PORT app:app
     envVars:
       - key: SECRET_KEY
         generateValue: true     # Render 가 안전한 무작위 비밀키를 자동 생성

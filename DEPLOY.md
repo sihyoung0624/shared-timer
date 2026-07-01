@@ -31,7 +31,7 @@
 
 ### Render 대시보드에서 직접 설정하는 경우 (Blueprint 대신)
 - **Build Command:** `pip install -r requirements.txt`
-- **Start Command:** `gunicorn -k eventlet -w 1 app:app`
+- **Start Command:** `gunicorn -k eventlet -w 1 --bind 0.0.0.0:$PORT app:app`
 - **Environment Variables:** 아래 표 참고
 
 ---
