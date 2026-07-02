@@ -163,6 +163,50 @@ def _snapshot(room):
     }
 
 
+# ===== 실시간 투표: 집계 도우미 =====
+def _poll_counts(poll):
+    """선택지별 득표 수를 센다."""
+    counts = [0] * len(poll['options'])
+    for rec in poll['votes'].values():
+        c = rec.get('choice')
+        if isinstance(c, int) and 0 <= c < len(counts):
+            counts[c] += 1
+    return counts
+
+
+def _poll_public(poll):
+    """[뷰어용] 질문·선택지·상태만. 집계(counts)는 '결과 공개(reveal)'가 켜졌을 때만 포함.
+    [보안] control_token 등 민감정보는 절대 포함하지 않는다."""
+    if poll is None:
+        return None
+    data = {
+        'id': poll['id'],
+        'question': poll['question'],
+        'options': poll['options'],
+        'status': poll['status'],
+        'reveal': poll['reveal'],
+        'total': len(poll['votes']),   # 참여 인원(결과 분포 아님)
+    }
+    if poll['reveal']:
+        data['counts'] = _poll_counts(poll)
+    return data
+
+
+def _poll_admin(poll):
+    """[컨트롤러용] 집계(counts)를 항상 포함. 컨트롤러 전용 채널로만 전송한다."""
+    if poll is None:
+        return None
+    return {
+        'id': poll['id'],
+        'question': poll['question'],
+        'options': poll['options'],
+        'status': poll['status'],
+        'reveal': poll['reveal'],
+        'counts': _poll_counts(poll),
+        'total': len(poll['votes']),
+    }
+
+
 @app.route('/')
 def home():
     return PAGE_HOME
@@ -201,6 +245,7 @@ def create():
             'message': '',              # 실시간 메시지(공대장 지시 등). 컨트롤러만 변경 가능
             'schedule': [],             # 예약 메시지 [{at:남은초, text, fired}]. 컨트롤러만 변경
             'start_at': None,           # 예약 시작 시각(Unix타임스탬프). None=예약 없음
+            'poll': None,               # 진행 중 투표(없으면 None). 컨트롤러만 생성/제어
         }
 
     # 뷰어용 절대주소(폰/외부에서 바로 열림). 로컬=LAN IP, 배포=공개 도메인으로 자동 결정.
@@ -267,9 +312,12 @@ def on_join(data):
             room['viewers'] += 1
             sid_to_room[sid] = room_id
         snap = _snapshot(room)
+        poll_pub = _poll_public(room.get('poll'))
     join_room(room_id)
     emit('state', snap)
     socketio.emit('tick', snap, room=room_id)
+    if poll_pub is not None:
+        emit('poll_state', poll_pub)   # 이미 열린 투표가 있으면 새로 들어온 뷰어에게도 표시
 
 
 def _check_controller(data):
@@ -389,6 +437,122 @@ def on_get_schedule(data):
             return
         sched = list(room['schedule'])
     emit('schedule_state', {'schedule': sched})
+
+
+# ===== 실시간 투표: 이벤트 (1단계) =====
+# [보안] 생성/종료는 컨트롤러만(토큰 검증). 집계는 컨트롤러 전용 방(room_id:ctrl)으로만 전송.
+
+@socketio.on('poll_open')
+def on_poll_open(data):
+    """[컨트롤러] 투표 생성 + 시작. 질문 1개 + 선택지 2~4개."""
+    with rooms_lock:
+        room_id, room = _check_controller(data)
+        if room is None:
+            emit('error_msg', {'message': '제어 권한이 없습니다.'})
+            return
+        question = str(data.get('question', '')).strip()[:200]
+        raw = data.get('options', [])
+        options = []
+        if isinstance(raw, list):
+            for o in raw:
+                s = str(o).strip()[:100]
+                if s:
+                    options.append(s)
+        # [검증] 질문 필수 + 선택지 2~4개
+        if not question or not (2 <= len(options) <= 4):
+            emit('error_msg', {'message': '질문과 선택지(2~4개)를 입력해주세요.'})
+            return
+        room['poll'] = {
+            'id': uuid.uuid4().hex[:6],
+            'question': question,
+            'options': options,
+            'status': 'open',      # open=접수중, closed=종료
+            'reveal': False,       # 뷰어 결과 공개 여부(기본 비공개)
+            'votes': {},           # voter_id -> {'choice': int, 'ts': None}  ('ts'는 추후 확장용)
+        }
+        pub = _poll_public(room['poll'])
+        adm = _poll_admin(room['poll'])
+    join_room(room_id + ':ctrl')                              # 컨트롤러 전용 방(집계 수신)
+    socketio.emit('poll_state', pub, room=room_id)            # 뷰어 전원: 질문+선택지 등장
+    socketio.emit('poll_admin', adm, room=room_id + ':ctrl')  # 컨트롤러: 집계 포함
+
+
+@socketio.on('poll_get')
+def on_poll_get(data):
+    """[컨트롤러] 접속 시 현재 투표(집계 포함)를 불러오고, 집계 수신 전용 방에 합류."""
+    with rooms_lock:
+        room_id, room = _check_controller(data)
+        if room is None:
+            return
+        adm = _poll_admin(room.get('poll'))
+    join_room(room_id + ':ctrl')      # [격리] 집계는 이 방으로만 → 뷰어에게 안 샘
+    emit('poll_admin', adm)
+
+
+@socketio.on('poll_vote')
+def on_poll_vote(data):
+    """[뷰어] 선택지에 투표. [검증] 열린 투표 + 유효한 선택지 번호만."""
+    room_id = data.get('room_id')
+    voter = str(data.get('voter_id', ''))[:64]
+    with rooms_lock:
+        room = rooms.get(room_id)
+        poll = room.get('poll') if room else None
+        if poll is None:
+            return
+        if poll['status'] != 'open':
+            emit('error_msg', {'message': '이미 종료된 투표입니다.'})
+            return
+        try:
+            choice = int(data.get('choice', -1))
+        except (ValueError, TypeError):
+            choice = -1
+        # [검증] 없는 선택지 번호 차단, voter_id 필수
+        if not voter or not (0 <= choice < len(poll['options'])):
+            return
+        # 1인 1표(느슨): voter_id 기준 갱신 → 같은 브라우저가 다시 누르면 이전 표를 대체
+        poll['votes'][voter] = {'choice': choice, 'ts': None}
+        pub = _poll_public(poll)
+        adm = _poll_admin(poll)
+    emit('poll_you', {'choice': choice})                      # 투표자 본인: 내 선택 확인
+    socketio.emit('poll_admin', adm, room=room_id + ':ctrl')  # 컨트롤러: 실시간 집계 갱신
+    # 뷰어 전원에게도 갱신: 비공개면 counts 없이 '참여 N명'만 실시간으로 는다
+    socketio.emit('poll_state', pub, room=room_id)
+
+
+@socketio.on('poll_reveal')
+def on_poll_reveal(data):
+    """[컨트롤러] 뷰어 결과 공개 토글. 켜면 뷰어도 집계를 보고, 끄면 다시 숨긴다."""
+    with rooms_lock:
+        room_id, room = _check_controller(data)
+        if room is None:
+            emit('error_msg', {'message': '제어 권한이 없습니다.'})
+            return
+        poll = room.get('poll')
+        if poll is None:
+            return
+        poll['reveal'] = not poll['reveal']
+        pub = _poll_public(poll)
+        adm = _poll_admin(poll)
+    socketio.emit('poll_state', pub, room=room_id)             # 뷰어: 공개면 counts 포함
+    socketio.emit('poll_admin', adm, room=room_id + ':ctrl')   # 컨트롤러: 버튼 상태 갱신
+
+
+@socketio.on('poll_close')
+def on_poll_close(data):
+    """[컨트롤러] 투표 종료 → 최종 결과 고정."""
+    with rooms_lock:
+        room_id, room = _check_controller(data)
+        if room is None:
+            emit('error_msg', {'message': '제어 권한이 없습니다.'})
+            return
+        poll = room.get('poll')
+        if poll is None:
+            return
+        poll['status'] = 'closed'
+        pub = _poll_public(poll)
+        adm = _poll_admin(poll)
+    socketio.emit('poll_state', pub, room=room_id)
+    socketio.emit('poll_admin', adm, room=room_id + ':ctrl')
 
 
 @socketio.on('disconnect')
@@ -572,6 +736,31 @@ CONTROLS_HTML = '''
  <button class="btn sky" onclick="addSchedule()">예약 추가</button>
  <div class="sched-list" id="schedList"></div>
 </div>
+<div class="panel">
+ <div class="panel-t">실시간 투표 <span class="panel-sub">뷰어들이 폰으로 선택</span></div>
+ <div id="pollCreate">
+  <input class="field" type="text" id="pollQ" maxlength="200" placeholder="질문 (예: 점심 뭐 먹을까요?)">
+  <div class="row" style="margin-top:8px;">
+   <input class="field" type="text" id="pollO1" maxlength="100" placeholder="선택지 1">
+   <input class="field" type="text" id="pollO2" maxlength="100" placeholder="선택지 2">
+  </div>
+  <div class="row" style="margin-top:8px;">
+   <input class="field" type="text" id="pollO3" maxlength="100" placeholder="선택지 3 (선택)">
+   <input class="field" type="text" id="pollO4" maxlength="100" placeholder="선택지 4 (선택)">
+  </div>
+  <button class="btn sky" style="margin-top:10px;width:100%;" onclick="pollOpen()">투표 시작</button>
+ </div>
+ <div id="pollLive" style="display:none;">
+  <div class="poll-q" id="pollAdminQ"></div>
+  <div id="pollBars"></div>
+  <div class="poll-meta" id="pollMeta"></div>
+  <div class="row" style="margin-top:10px;">
+   <button class="btn" id="revealBtn" onclick="pollReveal()">결과 공개</button>
+   <button class="btn" onclick="pollClose()">투표 종료</button>
+   <button class="btn" id="pollNewBtn" style="display:none;" onclick="pollNew()">새 투표</button>
+  </div>
+ </div>
+</div>
 '''
 
 
@@ -638,6 +827,25 @@ body.done .timer { animation:blink 1s steps(1) infinite; }
 .sched-row.fired { opacity:.4;text-decoration:line-through; }
 .sched-row button { padding:7px 12px;border:none;border-radius:9px;background:#2c3a56;
  color:#e2e8f0;font-size:13px;cursor:pointer;flex-shrink:0; }
+.poll-q { font-size:17px;font-weight:700;color:#f1f5f9;margin-bottom:4px;word-break:keep-all; }
+.poll-bar { margin-top:8px; }
+.poll-bar .pb-label { display:flex;justify-content:space-between;font-size:14px;color:#cbd5e1;margin-bottom:4px; }
+.poll-bar .pb-track { background:#0d1830;border:1px solid #223150;border-radius:9px;height:22px;overflow:hidden; }
+.poll-bar .pb-fill { height:100%;background:#38bdf8;border-radius:8px;width:0%;transition:width .3s ease; }
+.poll-bar.win .pb-fill { background:#22c55e; }
+.poll-meta { font-size:12px;color:#5b6b86;margin-top:8px; }
+.reveal-on { background:#22c55e !important;color:#052e16 !important;border-color:transparent !important; }
+.opt-btn { position:relative;display:block;width:100%;margin-top:8px;padding:14px;
+ border:1px solid #2b4066;border-radius:14px;background:#0d1830;color:#e2e8f0;
+ font-size:17px;font-weight:600;cursor:pointer;text-align:left;overflow:hidden; }
+.opt-btn .opt-fill { position:absolute;left:0;top:0;bottom:0;width:0%;
+ background:rgba(56,189,248,.18);transition:width .3s ease; }
+.opt-btn .opt-row { position:relative;display:flex;justify-content:space-between;gap:8px; }
+.opt-btn.mine { border-color:#38bdf8;background:#13233f; }
+.opt-btn.mine .opt-check { color:#7dd3fc; }
+.opt-btn:disabled { opacity:.75;cursor:default; }
+.opt-btn.win { border-color:#22c55e; }
+.opt-btn.win .opt-fill { background:rgba(34,197,94,.22); }
 </style></head><body>
 <div class="stage {{STAGE}}">
 <div class="topbar">
@@ -651,6 +859,12 @@ body.done .timer { animation:blink 1s steps(1) infinite; }
 <div class="msg-box" id="msgBox"></div>
 <div class="timer" id="timer">--:--</div>
 <div class="status-text" id="statusText">연결 중...</div>
+<div class="panel" id="pollView" style="display:none;">
+ <div class="panel-t">투표 <span class="panel-sub" id="pollViewSt"></span></div>
+ <div class="poll-q" id="pollViewQ"></div>
+ <div id="pollViewOpts"></div>
+ <div class="poll-meta" id="pollViewInfo"></div>
+</div>
 {{CONTROLS}}
 </div>
 <script>
@@ -699,8 +913,11 @@ function tryUnlock(){ const ctx=getCtx(); if(ctx && ctx.state==='suspended') ctx
 document.addEventListener('click', tryUnlock);
 document.addEventListener('touchstart', tryUnlock, {passive:true});
 
-socket.on('connect',()=>{ socket.emit('join',{room_id:ROOM_ID}); if(IS_CONTROLLER) socket.emit('get_schedule',{room_id:ROOM_ID,token:TOKEN}); });
+socket.on('connect',()=>{ socket.emit('join',{room_id:ROOM_ID}); if(IS_CONTROLLER){ socket.emit('get_schedule',{room_id:ROOM_ID,token:TOKEN}); socket.emit('poll_get',{room_id:ROOM_ID,token:TOKEN}); } });
 socket.on('schedule_state',(d)=>{ renderSchedule(d.schedule||[]); });
+socket.on('poll_admin',(d)=>{ if(IS_CONTROLLER) renderPollAdmin(d); });
+socket.on('poll_state',(d)=>{ if(!IS_CONTROLLER) renderPollView(d); });
+socket.on('poll_you',(d)=>{ myChoice=d.choice; if(lastPoll) renderPollView(lastPoll); });
 socket.on('state',render);
 socket.on('tick',render);
 socket.on('finished',render);
@@ -800,6 +1017,95 @@ function fmtClock(ts){
  const h=d.getHours(), m=d.getMinutes();
  const ap=h<12?'오전':'오후'; let hh=h%12; if(hh===0)hh=12;
  return ap+' '+hh+':'+String(m).padStart(2,'0');
+}
+// --- 실시간 투표 (컨트롤러 전용) ---
+function pollOpen(){
+ const q=document.getElementById('pollQ').value.trim();
+ const opts=['pollO1','pollO2','pollO3','pollO4']
+   .map(id=>document.getElementById(id).value.trim()).filter(v=>v);
+ if(!q){ alert('질문을 입력해주세요.'); return; }
+ if(opts.length<2){ alert('선택지를 2개 이상 입력해주세요.'); return; }
+ socket.emit('poll_open',{room_id:ROOM_ID,token:TOKEN,question:q,options:opts});
+}
+function pollReveal(){ socket.emit('poll_reveal',{room_id:ROOM_ID,token:TOKEN}); }
+function pollClose(){ socket.emit('poll_close',{room_id:ROOM_ID,token:TOKEN}); }
+function pollNew(){
+ // 입력 폼으로 복귀(새 투표 준비). 이전 질문·선택지는 지운다.
+ ['pollQ','pollO1','pollO2','pollO3','pollO4'].forEach(id=>{ document.getElementById(id).value=''; });
+ document.getElementById('pollLive').style.display='none';
+ document.getElementById('pollCreate').style.display='block';
+}
+function renderPollAdmin(d){
+ const create=document.getElementById('pollCreate'), live=document.getElementById('pollLive');
+ if(!create||!live) return;
+ if(!d){ create.style.display='block'; live.style.display='none'; return; }
+ create.style.display='none'; live.style.display='block';
+ document.getElementById('pollAdminQ').textContent=d.question;   // [보안] textContent=XSS차단
+ const bars=document.getElementById('pollBars'); bars.textContent='';
+ const total=d.total||0, max=Math.max(...d.counts,1);
+ d.options.forEach((opt,i)=>{
+  const n=d.counts[i]||0;
+  const wrap=document.createElement('div');
+  wrap.className='poll-bar'+((d.status==='closed'&&n===max&&n>0)?' win':'');
+  const lab=document.createElement('div'); lab.className='pb-label';
+  const s1=document.createElement('span'); s1.textContent=opt;
+  const s2=document.createElement('span'); s2.textContent=n+'표'+(total?' ('+Math.round(n/total*100)+'%)':'');
+  lab.appendChild(s1); lab.appendChild(s2);
+  const track=document.createElement('div'); track.className='pb-track';
+  const fill=document.createElement('div'); fill.className='pb-fill';
+  fill.style.width=(total? (n/total*100) : 0)+'%';
+  track.appendChild(fill); wrap.appendChild(lab); wrap.appendChild(track);
+  bars.appendChild(wrap);
+ });
+ const st=(d.status==='open')?'접수 중':'종료됨(결과 고정)';
+ document.getElementById('pollMeta').textContent='참여 '+total+'명 · '+st+(d.reveal?' · 뷰어에게 결과 공개 중':' · 결과 비공개(진행자만 봄)');
+ const rb=document.getElementById('revealBtn');
+ rb.classList.toggle('reveal-on', !!d.reveal);
+ rb.textContent=d.reveal?'공개 중 (끄기)':'결과 공개';
+ document.getElementById('pollNewBtn').style.display=(d.status==='closed')?'block':'none';
+}
+// --- 실시간 투표 (뷰어 참여) ---
+// [1인1표-느슨] 브라우저마다 무작위 표식(voter_id)을 저장해 재투표 시 이전 표를 대체
+function getVoterId(){
+ let id=localStorage.getItem('timer_voter_id');
+ if(!id){ id=Math.random().toString(36).slice(2)+Date.now().toString(36);
+  localStorage.setItem('timer_voter_id',id); }
+ return id;
+}
+let myChoice=null, lastPoll=null, lastPollId=null;
+function voteFor(i){ socket.emit('poll_vote',{room_id:ROOM_ID,voter_id:getVoterId(),choice:i}); }
+function renderPollView(d){
+ const box=document.getElementById('pollView'); if(!box) return;
+ lastPoll=d;
+ if(!d){ box.style.display='none'; return; }
+ if(d.id!==lastPollId){ lastPollId=d.id; myChoice=null; messageBeep(); }  // 새 투표 등장 알림음
+ box.style.display='block';
+ document.getElementById('pollViewQ').textContent=d.question;             // [보안] textContent
+ document.getElementById('pollViewSt').textContent=(d.status==='open')?'진행 중 · 눌러서 선택':'종료됨';
+ const open=(d.status==='open');
+ const counts=d.counts||null, total=d.total||0;
+ const max=counts?Math.max(...counts,1):0;
+ const wrap=document.getElementById('pollViewOpts'); wrap.textContent='';
+ d.options.forEach((opt,i)=>{
+  const b=document.createElement('button');
+  b.className='opt-btn'+(myChoice===i?' mine':'')
+    +((counts&&d.status==='closed'&&counts[i]===max&&counts[i]>0)?' win':'');
+  b.disabled=!open;
+  if(open) b.onclick=()=>voteFor(i);
+  const fill=document.createElement('div'); fill.className='opt-fill';
+  if(counts&&total) fill.style.width=(counts[i]/total*100)+'%';
+  const row=document.createElement('div'); row.className='opt-row';
+  const s1=document.createElement('span'); s1.textContent=(myChoice===i?'✓ ':'')+opt;
+  if(myChoice===i) s1.classList.add('opt-check');
+  const s2=document.createElement('span');
+  if(counts) s2.textContent=counts[i]+'표'+(total?' ('+Math.round(counts[i]/total*100)+'%)':'');
+  row.appendChild(s1); row.appendChild(s2);
+  b.appendChild(fill); b.appendChild(row); wrap.appendChild(b);
+ });
+ let info='참여 '+total+'명';
+ if(!counts) info+=(open?' · 결과는 진행자가 공개하면 표시됩니다':' · 결과 비공개');
+ if(myChoice!==null&&open) info+=' · 다른 항목을 누르면 선택이 바뀝니다';
+ document.getElementById('pollViewInfo').textContent=info;
 }
 function toggleFullscreen(){
  if(!document.fullscreenElement){ document.documentElement.requestFullscreen().catch(()=>{}); }
