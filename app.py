@@ -164,6 +164,8 @@ def _snapshot(room):
 
 
 # ===== 실시간 투표: 집계 도우미 =====
+RANK_LIMIT = 10   # 선착순 순위 표시 인원 상한
+
 def _poll_counts(poll):
     """선택지별 득표 수를 센다."""
     counts = [0] * len(poll['options'])
@@ -174,13 +176,30 @@ def _poll_counts(poll):
     return counts
 
 
+def _poll_ranking(poll):
+    """[선착순] 누른 시각(ts) 순서로 순위 명단을 만든다.
+    - race(손들기): 누른 전원이 대상
+    - quiz(퀴즈)  : '정답'을 누른 사람만 대상
+    반환: [{'name':닉네임, 'ts':초} ...] (빠른 순, 상위 RANK_LIMIT 명)"""
+    entries = []
+    for rec in poll['votes'].values():
+        if poll['type'] == 'quiz' and rec.get('choice') != poll.get('answer'):
+            continue   # 퀴즈는 정답자만 순위에 오름
+        if rec.get('ts') is None:
+            continue
+        entries.append({'name': rec.get('name') or '이름없음', 'ts': rec['ts']})
+    entries.sort(key=lambda x: x['ts'])
+    return entries[:RANK_LIMIT]
+
+
 def _poll_public(poll):
-    """[뷰어용] 질문·선택지·상태만. 집계(counts)는 '결과 공개(reveal)'가 켜졌을 때만 포함.
-    [보안] control_token 등 민감정보는 절대 포함하지 않는다."""
+    """[뷰어용] 질문·선택지·상태만. 집계/순위는 '결과 공개(reveal)'가 켜졌을 때만 포함.
+    [보안] control_token 미포함. 퀴즈 정답(answer)은 공개(reveal) 전엔 절대 미포함(컨닝 차단)."""
     if poll is None:
         return None
     data = {
         'id': poll['id'],
+        'type': poll['type'],
         'question': poll['question'],
         'options': poll['options'],
         'status': poll['status'],
@@ -189,15 +208,20 @@ def _poll_public(poll):
     }
     if poll['reveal']:
         data['counts'] = _poll_counts(poll)
+        if poll['type'] in ('race', 'quiz'):
+            data['ranking'] = _poll_ranking(poll)
+        if poll['type'] == 'quiz':
+            data['answer'] = poll.get('answer')   # 공개 시에만 정답 알림
     return data
 
 
 def _poll_admin(poll):
-    """[컨트롤러용] 집계(counts)를 항상 포함. 컨트롤러 전용 채널로만 전송한다."""
+    """[컨트롤러용] 집계·순위·정답을 항상 포함. 컨트롤러 전용 채널로만 전송한다."""
     if poll is None:
         return None
-    return {
+    data = {
         'id': poll['id'],
+        'type': poll['type'],
         'question': poll['question'],
         'options': poll['options'],
         'status': poll['status'],
@@ -205,6 +229,11 @@ def _poll_admin(poll):
         'counts': _poll_counts(poll),
         'total': len(poll['votes']),
     }
+    if poll['type'] in ('race', 'quiz'):
+        data['ranking'] = _poll_ranking(poll)
+    if poll['type'] == 'quiz':
+        data['answer'] = poll.get('answer')
+    return data
 
 
 @app.route('/')
@@ -444,12 +473,16 @@ def on_get_schedule(data):
 
 @socketio.on('poll_open')
 def on_poll_open(data):
-    """[컨트롤러] 투표 생성 + 시작. 질문 1개 + 선택지 2~4개."""
+    """[컨트롤러] 투표 생성 + 시작.
+    type: 'choice'=선택 투표(기본) / 'race'=선착순 손들기 / 'quiz'=선착순 퀴즈(정답 있음)"""
     with rooms_lock:
         room_id, room = _check_controller(data)
         if room is None:
             emit('error_msg', {'message': '제어 권한이 없습니다.'})
             return
+        ptype = data.get('type', 'choice')
+        if ptype not in ('choice', 'race', 'quiz'):
+            ptype = 'choice'
         question = str(data.get('question', '')).strip()[:200]
         raw = data.get('options', [])
         options = []
@@ -458,17 +491,34 @@ def on_poll_open(data):
                 s = str(o).strip()[:100]
                 if s:
                     options.append(s)
-        # [검증] 질문 필수 + 선택지 2~4개
-        if not question or not (2 <= len(options) <= 4):
-            emit('error_msg', {'message': '질문과 선택지(2~4개)를 입력해주세요.'})
+        answer = None
+        # [검증] 종류별 필수값
+        if not question:
+            emit('error_msg', {'message': '질문을 입력해주세요.'})
             return
+        if ptype == 'race':
+            options = []           # 손들기는 선택지 없음(버튼 하나)
+        else:
+            if not (2 <= len(options) <= 4):
+                emit('error_msg', {'message': '선택지(2~4개)를 입력해주세요.'})
+                return
+        if ptype == 'quiz':
+            try:
+                answer = int(data.get('answer', -1))
+            except (ValueError, TypeError):
+                answer = -1
+            if not (0 <= answer < len(options)):
+                emit('error_msg', {'message': '퀴즈는 정답을 선택해주세요.'})
+                return
         room['poll'] = {
             'id': uuid.uuid4().hex[:6],
+            'type': ptype,
             'question': question,
             'options': options,
+            'answer': answer,      # 퀴즈 정답 인덱스(그 외 None). [보안] 공개 전 뷰어 미전송
             'status': 'open',      # open=접수중, closed=종료
             'reveal': False,       # 뷰어 결과 공개 여부(기본 비공개)
-            'votes': {},           # voter_id -> {'choice': int, 'ts': None}  ('ts'는 추후 확장용)
+            'votes': {},           # voter_id -> {'choice': int, 'ts': 초, 'name': 닉네임}
         }
         pub = _poll_public(room['poll'])
         adm = _poll_admin(room['poll'])
@@ -491,9 +541,12 @@ def on_poll_get(data):
 
 @socketio.on('poll_vote')
 def on_poll_vote(data):
-    """[뷰어] 선택지에 투표. [검증] 열린 투표 + 유효한 선택지 번호만."""
+    """[뷰어] 투표/손들기/퀴즈 참여. [검증] 열린 투표 + 유효한 선택지만.
+    - choice(선택 투표): 다시 누르면 이전 표를 대체(갱신 허용)
+    - race/quiz(선착순): '첫 클릭이 최종' — 재클릭 무시(순위 조작 방지)"""
     room_id = data.get('room_id')
     voter = str(data.get('voter_id', ''))[:64]
+    name = str(data.get('name', '')).strip()[:20]   # 선착순 순위 표시용 닉네임
     with rooms_lock:
         room = rooms.get(room_id)
         poll = room.get('poll') if room else None
@@ -506,15 +559,27 @@ def on_poll_vote(data):
             choice = int(data.get('choice', -1))
         except (ValueError, TypeError):
             choice = -1
-        # [검증] 없는 선택지 번호 차단, voter_id 필수
-        if not voter or not (0 <= choice < len(poll['options'])):
+        n_opts = len(poll['options']) if poll['type'] != 'race' else 1   # race 는 choice=0 하나뿐
+        if not voter or not (0 <= choice < n_opts):
             return
-        # 1인 1표(느슨): voter_id 기준 갱신 → 같은 브라우저가 다시 누르면 이전 표를 대체
-        poll['votes'][voter] = {'choice': choice, 'ts': None}
+        if poll['type'] in ('race', 'quiz') and voter in poll['votes']:
+            return   # [선착순] 첫 클릭이 최종 — 재클릭·선택변경 불가
+        # [확장 대비] ts(누른 시각)를 서버 시계로 기록 → 클라이언트 시계 조작 무의미
+        poll['votes'][voter] = {'choice': choice, 'ts': time.time(), 'name': name}
+        my_rank = None
+        # [보안] 순위 즉시 알림은 '손들기'만. 퀴즈는 순위를 알려주면 정답 여부가
+        # 새어나가(맞은 사람만 순위가 있음) 옆사람 컨닝이 가능 → 공개 때까지 숨김.
+        if poll['type'] == 'race':
+            ranking = _poll_ranking(poll)
+            for i, e in enumerate(ranking):
+                if e['ts'] == poll['votes'][voter]['ts']:
+                    my_rank = i + 1
+                    break
         pub = _poll_public(poll)
         adm = _poll_admin(poll)
-    emit('poll_you', {'choice': choice})                      # 투표자 본인: 내 선택 확인
-    socketio.emit('poll_admin', adm, room=room_id + ':ctrl')  # 컨트롤러: 실시간 집계 갱신
+    # 본인 확인: 내 선택 + (손들기면) 내 순위
+    emit('poll_you', {'choice': choice, 'rank': my_rank})
+    socketio.emit('poll_admin', adm, room=room_id + ':ctrl')  # 컨트롤러: 실시간 집계·순위
     # 뷰어 전원에게도 갱신: 비공개면 counts 없이 '참여 N명'만 실시간으로 는다
     socketio.emit('poll_state', pub, room=room_id)
 
@@ -737,27 +802,40 @@ CONTROLS_HTML = '''
  <div class="sched-list" id="schedList"></div>
 </div>
 <div class="panel">
- <div class="panel-t">실시간 투표 <span class="panel-sub">뷰어들이 폰으로 선택</span></div>
+ <div class="panel-t">실시간 투표·선착순 <span class="panel-sub">뷰어들이 폰으로 참여</span></div>
  <div id="pollCreate">
-  <input class="field" type="text" id="pollQ" maxlength="200" placeholder="질문 (예: 점심 뭐 먹을까요?)">
-  <div class="row" style="margin-top:8px;">
-   <input class="field" type="text" id="pollO1" maxlength="100" placeholder="선택지 1">
-   <input class="field" type="text" id="pollO2" maxlength="100" placeholder="선택지 2">
+  <div class="row mode-row">
+   <button class="btn mode on" id="modeChoice" onclick="setPollMode('choice')">선택 투표</button>
+   <button class="btn mode" id="modeRace" onclick="setPollMode('race')">선착순 손들기</button>
+   <button class="btn mode" id="modeQuiz" onclick="setPollMode('quiz')">선착순 퀴즈</button>
   </div>
-  <div class="row" style="margin-top:8px;">
-   <input class="field" type="text" id="pollO3" maxlength="100" placeholder="선택지 3 (선택)">
-   <input class="field" type="text" id="pollO4" maxlength="100" placeholder="선택지 4 (선택)">
+  <input class="field" type="text" id="pollQ" maxlength="200" placeholder="질문 (예: 점심 뭐 먹을까요?)" style="margin-top:8px;">
+  <div id="pollOptsArea">
+   <div class="row" style="margin-top:8px;">
+    <input class="field" type="text" id="pollO1" maxlength="100" placeholder="선택지 1">
+    <input class="field" type="text" id="pollO2" maxlength="100" placeholder="선택지 2">
+   </div>
+   <div class="row" style="margin-top:8px;">
+    <input class="field" type="text" id="pollO3" maxlength="100" placeholder="선택지 3 (선택)">
+    <input class="field" type="text" id="pollO4" maxlength="100" placeholder="선택지 4 (선택)">
+   </div>
+   <select class="field" id="pollAnswer" style="display:none;margin-top:8px;">
+    <option value="">정답 선택 (퀴즈)</option>
+    <option value="0">선택지 1</option><option value="1">선택지 2</option>
+    <option value="2">선택지 3</option><option value="3">선택지 4</option>
+   </select>
   </div>
-  <button class="btn sky" style="margin-top:10px;width:100%;" onclick="pollOpen()">투표 시작</button>
+  <button class="btn sky" style="margin-top:10px;width:100%;" id="pollOpenBtn" onclick="pollOpen()">투표 시작</button>
  </div>
  <div id="pollLive" style="display:none;">
   <div class="poll-q" id="pollAdminQ"></div>
   <div id="pollBars"></div>
+  <div id="pollRank"></div>
   <div class="poll-meta" id="pollMeta"></div>
   <div class="row" style="margin-top:10px;">
    <button class="btn" id="revealBtn" onclick="pollReveal()">결과 공개</button>
-   <button class="btn" onclick="pollClose()">투표 종료</button>
-   <button class="btn" id="pollNewBtn" style="display:none;" onclick="pollNew()">새 투표</button>
+   <button class="btn" onclick="pollClose()">종료</button>
+   <button class="btn" id="pollNewBtn" style="display:none;" onclick="pollNew()">새로 만들기</button>
   </div>
  </div>
 </div>
@@ -846,6 +924,17 @@ body.done .timer { animation:blink 1s steps(1) infinite; }
 .opt-btn:disabled { opacity:.75;cursor:default; }
 .opt-btn.win { border-color:#22c55e; }
 .opt-btn.win .opt-fill { background:rgba(34,197,94,.22); }
+.mode-row .mode { font-size:14px;padding:10px 6px; }
+.mode-row .mode.on { background:#38bdf8;color:#052538;border-color:transparent; }
+.rank-list { margin-top:8px;display:flex;flex-direction:column;gap:5px; }
+.rank-row { display:flex;align-items:center;gap:10px;background:#0d1830;border:1px solid #223150;
+ border-radius:10px;padding:8px 12px;font-size:15px;color:#e2e8f0; }
+.rank-row .rk { font-weight:800;color:#7dd3fc;min-width:34px; }
+.rank-row.top1 { border-color:#22c55e; } .rank-row.top1 .rk { color:#22c55e; }
+.race-btn { display:block;width:100%;margin-top:10px;padding:22px;border:none;border-radius:16px;
+ background:#22c55e;color:#052e16;font-size:22px;font-weight:800;cursor:pointer; }
+.race-btn:disabled { opacity:.6;cursor:default; }
+.race-done { margin-top:10px;text-align:center;font-size:20px;font-weight:800;color:#7dd3fc; }
 </style></head><body>
 <div class="stage {{STAGE}}">
 <div class="topbar">
@@ -917,7 +1006,7 @@ socket.on('connect',()=>{ socket.emit('join',{room_id:ROOM_ID}); if(IS_CONTROLLE
 socket.on('schedule_state',(d)=>{ renderSchedule(d.schedule||[]); });
 socket.on('poll_admin',(d)=>{ if(IS_CONTROLLER) renderPollAdmin(d); });
 socket.on('poll_state',(d)=>{ if(!IS_CONTROLLER) renderPollView(d); });
-socket.on('poll_you',(d)=>{ myChoice=d.choice; if(lastPoll) renderPollView(lastPoll); });
+socket.on('poll_you',(d)=>{ myChoice=d.choice; if(d.rank) myRank=d.rank; if(lastPoll) renderPollView(lastPoll); });
 socket.on('state',render);
 socket.on('tick',render);
 socket.on('finished',render);
@@ -1019,13 +1108,33 @@ function fmtClock(ts){
  return ap+' '+hh+':'+String(m).padStart(2,'0');
 }
 // --- 실시간 투표 (컨트롤러 전용) ---
+let pollMode='choice';
+function setPollMode(m){
+ pollMode=m;
+ const ids={choice:'modeChoice',race:'modeRace',quiz:'modeQuiz'};
+ Object.values(ids).forEach(id=>{const el=document.getElementById(id); if(el)el.classList.remove('on');});
+ document.getElementById(ids[m]).classList.add('on');
+ document.getElementById('pollOptsArea').style.display=(m==='race')?'none':'block';
+ document.getElementById('pollAnswer').style.display=(m==='quiz')?'block':'none';
+ document.getElementById('pollQ').placeholder=(m==='race')?'질문 (예: 발표하실 분? 선착순 3명!)':(m==='quiz')?'퀴즈 문제':'질문 (예: 점심 뭐 먹을까요?)';
+ document.getElementById('pollOpenBtn').textContent=(m==='race')?'손들기 시작':(m==='quiz')?'퀴즈 시작':'투표 시작';
+}
 function pollOpen(){
  const q=document.getElementById('pollQ').value.trim();
- const opts=['pollO1','pollO2','pollO3','pollO4']
-   .map(id=>document.getElementById(id).value.trim()).filter(v=>v);
  if(!q){ alert('질문을 입력해주세요.'); return; }
- if(opts.length<2){ alert('선택지를 2개 이상 입력해주세요.'); return; }
- socket.emit('poll_open',{room_id:ROOM_ID,token:TOKEN,question:q,options:opts});
+ const payload={room_id:ROOM_ID,token:TOKEN,type:pollMode,question:q};
+ if(pollMode!=='race'){
+  const opts=['pollO1','pollO2','pollO3','pollO4']
+    .map(id=>document.getElementById(id).value.trim()).filter(v=>v);
+  if(opts.length<2){ alert('선택지를 2개 이상 입력해주세요.'); return; }
+  payload.options=opts;
+  if(pollMode==='quiz'){
+   const a=document.getElementById('pollAnswer').value;
+   if(a===''||parseInt(a)>=opts.length){ alert('퀴즈 정답을 선택해주세요.'); return; }
+   payload.answer=parseInt(a);
+  }
+ }
+ socket.emit('poll_open',payload);
 }
 function pollReveal(){ socket.emit('poll_reveal',{room_id:ROOM_ID,token:TOKEN}); }
 function pollClose(){ socket.emit('poll_close',{room_id:ROOM_ID,token:TOKEN}); }
@@ -1035,6 +1144,19 @@ function pollNew(){
  document.getElementById('pollLive').style.display='none';
  document.getElementById('pollCreate').style.display='block';
 }
+function renderRanking(el, ranking, label){
+ el.textContent='';
+ if(!ranking||!ranking.length){ return; }
+ const box=document.createElement('div'); box.className='rank-list';
+ if(label){ const t=document.createElement('div'); t.className='poll-meta'; t.textContent=label; el.appendChild(t); }
+ ranking.forEach((e,i)=>{
+  const row=document.createElement('div'); row.className='rank-row'+(i===0?' top1':'');
+  const rk=document.createElement('span'); rk.className='rk'; rk.textContent=(i+1)+'등';
+  const nm=document.createElement('span'); nm.textContent=e.name;    // [보안] textContent
+  row.appendChild(rk); row.appendChild(nm); box.appendChild(row);
+ });
+ el.appendChild(box);
+}
 function renderPollAdmin(d){
  const create=document.getElementById('pollCreate'), live=document.getElementById('pollLive');
  if(!create||!live) return;
@@ -1042,21 +1164,27 @@ function renderPollAdmin(d){
  create.style.display='none'; live.style.display='block';
  document.getElementById('pollAdminQ').textContent=d.question;   // [보안] textContent=XSS차단
  const bars=document.getElementById('pollBars'); bars.textContent='';
- const total=d.total||0, max=Math.max(...d.counts,1);
- d.options.forEach((opt,i)=>{
-  const n=d.counts[i]||0;
-  const wrap=document.createElement('div');
-  wrap.className='poll-bar'+((d.status==='closed'&&n===max&&n>0)?' win':'');
-  const lab=document.createElement('div'); lab.className='pb-label';
-  const s1=document.createElement('span'); s1.textContent=opt;
-  const s2=document.createElement('span'); s2.textContent=n+'표'+(total?' ('+Math.round(n/total*100)+'%)':'');
-  lab.appendChild(s1); lab.appendChild(s2);
-  const track=document.createElement('div'); track.className='pb-track';
-  const fill=document.createElement('div'); fill.className='pb-fill';
-  fill.style.width=(total? (n/total*100) : 0)+'%';
-  track.appendChild(fill); wrap.appendChild(lab); wrap.appendChild(track);
-  bars.appendChild(wrap);
- });
+ const total=d.total||0;
+ if(d.type!=='race'){
+  const max=Math.max(...d.counts,1);
+  d.options.forEach((opt,i)=>{
+   const n=d.counts[i]||0;
+   const isAns=(d.type==='quiz'&&i===d.answer);
+   const wrap=document.createElement('div');
+   wrap.className='poll-bar'+((isAns||(d.type==='choice'&&d.status==='closed'&&n===max&&n>0))?' win':'');
+   const lab=document.createElement('div'); lab.className='pb-label';
+   const s1=document.createElement('span'); s1.textContent=(isAns?'★ ':'')+opt;
+   const s2=document.createElement('span'); s2.textContent=n+'표'+(total?' ('+Math.round(n/total*100)+'%)':'');
+   lab.appendChild(s1); lab.appendChild(s2);
+   const track=document.createElement('div'); track.className='pb-track';
+   const fill=document.createElement('div'); fill.className='pb-fill';
+   fill.style.width=(total? (n/total*100) : 0)+'%';
+   track.appendChild(fill); wrap.appendChild(lab); wrap.appendChild(track);
+   bars.appendChild(wrap);
+  });
+ }
+ renderRanking(document.getElementById('pollRank'), d.ranking,
+   d.type==='race'?'선착순 순위':d.type==='quiz'?'정답자 순위(빠른 순)':'');
  const st=(d.status==='open')?'접수 중':'종료됨(결과 고정)';
  document.getElementById('pollMeta').textContent='참여 '+total+'명 · '+st+(d.reveal?' · 뷰어에게 결과 공개 중':' · 결과 비공개(진행자만 봄)');
  const rb=document.getElementById('revealBtn');
@@ -1072,39 +1200,71 @@ function getVoterId(){
   localStorage.setItem('timer_voter_id',id); }
  return id;
 }
-let myChoice=null, lastPoll=null, lastPollId=null;
-function voteFor(i){ socket.emit('poll_vote',{room_id:ROOM_ID,voter_id:getVoterId(),choice:i}); }
+let myChoice=null, myRank=null, lastPoll=null, lastPollId=null;
+// [선착순] 순위표에 표시할 닉네임 — 처음 한 번 물어보고 폰에 저장
+function getNick(){
+ let n=localStorage.getItem('timer_nick')||'';
+ if(!n){
+  n=(prompt('순위표에 표시할 닉네임(이름)을 입력하세요')||'').trim().slice(0,20);
+  if(n) localStorage.setItem('timer_nick',n);
+ }
+ return n||'이름없음';
+}
+function voteFor(i){
+ const payload={room_id:ROOM_ID,voter_id:getVoterId(),choice:i};
+ if(lastPoll&&lastPoll.type!=='choice') payload.name=getNick();  // 선착순만 닉네임 필요
+ socket.emit('poll_vote',payload);
+}
 function renderPollView(d){
  const box=document.getElementById('pollView'); if(!box) return;
  lastPoll=d;
  if(!d){ box.style.display='none'; return; }
- if(d.id!==lastPollId){ lastPollId=d.id; myChoice=null; messageBeep(); }  // 새 투표 등장 알림음
+ if(d.id!==lastPollId){ lastPollId=d.id; myChoice=null; myRank=null; messageBeep(); }  // 새 투표 알림음
  box.style.display='block';
  document.getElementById('pollViewQ').textContent=d.question;             // [보안] textContent
- document.getElementById('pollViewSt').textContent=(d.status==='open')?'진행 중 · 눌러서 선택':'종료됨';
  const open=(d.status==='open');
+ const stMap={race:'선착순! 빨리 누르세요',quiz:'퀴즈 · 첫 선택이 최종!',choice:'진행 중 · 눌러서 선택'};
+ document.getElementById('pollViewSt').textContent=open?stMap[d.type]:'종료됨';
  const counts=d.counts||null, total=d.total||0;
- const max=counts?Math.max(...counts,1):0;
  const wrap=document.getElementById('pollViewOpts'); wrap.textContent='';
- d.options.forEach((opt,i)=>{
-  const b=document.createElement('button');
-  b.className='opt-btn'+(myChoice===i?' mine':'')
-    +((counts&&d.status==='closed'&&counts[i]===max&&counts[i]>0)?' win':'');
-  b.disabled=!open;
-  if(open) b.onclick=()=>voteFor(i);
-  const fill=document.createElement('div'); fill.className='opt-fill';
-  if(counts&&total) fill.style.width=(counts[i]/total*100)+'%';
-  const row=document.createElement('div'); row.className='opt-row';
-  const s1=document.createElement('span'); s1.textContent=(myChoice===i?'✓ ':'')+opt;
-  if(myChoice===i) s1.classList.add('opt-check');
-  const s2=document.createElement('span');
-  if(counts) s2.textContent=counts[i]+'표'+(total?' ('+Math.round(counts[i]/total*100)+'%)':'');
-  row.appendChild(s1); row.appendChild(s2);
-  b.appendChild(fill); b.appendChild(row); wrap.appendChild(b);
- });
+ if(d.type==='race'){
+  // 손들기: 큰 버튼 하나. 누르면 내 등수 표시
+  if(myChoice===null&&open){
+   const b=document.createElement('button'); b.className='race-btn';
+   b.textContent='🙋 손들기!'; b.onclick=()=>voteFor(0);
+   wrap.appendChild(b);
+  } else if(myChoice!==null){
+   const done=document.createElement('div'); done.className='race-done';
+   done.textContent=myRank?('🎉 '+myRank+'등으로 접수됐습니다!'):'✋ 접수됐습니다!';
+   wrap.appendChild(done);
+  }
+ } else {
+  const lock=(d.type==='quiz'&&myChoice!==null);   // 퀴즈: 첫 선택 후 잠금
+  d.options.forEach((opt,i)=>{
+   const isAns=(d.type==='quiz'&&d.answer!==undefined&&d.answer===i);
+   const b=document.createElement('button');
+   b.className='opt-btn'+(myChoice===i?' mine':'')+(isAns?' win':'');
+   b.disabled=!open||lock;
+   if(open&&!lock) b.onclick=()=>voteFor(i);
+   const fill=document.createElement('div'); fill.className='opt-fill';
+   if(counts&&total) fill.style.width=(counts[i]/total*100)+'%';
+   const row=document.createElement('div'); row.className='opt-row';
+   const s1=document.createElement('span'); s1.textContent=(myChoice===i?'✓ ':'')+(isAns?'★ ':'')+opt;
+   if(myChoice===i) s1.classList.add('opt-check');
+   const s2=document.createElement('span');
+   if(counts) s2.textContent=counts[i]+'표'+(total?' ('+Math.round(counts[i]/total*100)+'%)':'');
+   row.appendChild(s1); row.appendChild(s2);
+   b.appendChild(fill); b.appendChild(row); wrap.appendChild(b);
+  });
+ }
+ if(d.ranking){  // 결과 공개 시 순위 명단
+  const rankBox=document.createElement('div');
+  renderRanking(rankBox, d.ranking, d.type==='quiz'?'정답자 순위(빠른 순)':'선착순 순위');
+  wrap.appendChild(rankBox);
+ }
  let info='참여 '+total+'명';
  if(!counts) info+=(open?' · 결과는 진행자가 공개하면 표시됩니다':' · 결과 비공개');
- if(myChoice!==null&&open) info+=' · 다른 항목을 누르면 선택이 바뀝니다';
+ if(d.type==='choice'&&myChoice!==null&&open) info+=' · 다른 항목을 누르면 선택이 바뀝니다';
  document.getElementById('pollViewInfo').textContent=info;
 }
 function toggleFullscreen(){
