@@ -1235,7 +1235,7 @@ function fmt(total){
  return h>0?`${pad(h)}:${pad(m)}:${pad(s)}`:`${pad(m)}:${pad(s)}`;
 }
 function endRoom(){
- if(confirm('타이머를 완전히 종료할까요?\n모든 참가자의 화면이 닫히고 링크도 만료됩니다.'))
+ if(confirm('타이머를 완전히 종료할까요?\\n모든 참가자의 화면이 닫히고 링크도 만료됩니다.'))
   ctrl('end_room');
 }
 function ctrl(action){ socket.emit('control',{room_id:ROOM_ID,token:TOKEN,action}); }
