@@ -45,7 +45,9 @@ rooms_lock = threading.Lock()   # 동시 사용 시 데이터 꼬임 방지
 sid_to_room = {}                # [버그②수정] 소켓ID → 방ID (퇴장 시 인원 정확히 차감)
 MAX_VIEWERS = 30
 MAX_ROOMS = int(os.environ.get('MAX_ROOMS', 500))      # [남용방지] 동시에 존재 가능한 방 수 상한
-ROOM_TTL = int(os.environ.get('ROOM_TTL', 6 * 3600))   # [남용방지] 생성 후 이 시간(초) 지나면 자동 정리
+ROOM_TTL = int(os.environ.get('ROOM_TTL', 6 * 3600))   # [남용방지] 최소 유지 시간(장기 타이머는 끝날 때까지+1시간 유지)
+MAX_DURATION = 30 * 86400   # 기간 설정 상한: 30일
+MAX_UNTIL = 90 * 86400      # '특정 시각까지' 설정 상한: 90일 뒤
 
 
 def get_local_ip():
@@ -85,7 +87,7 @@ def cleanup_rooms():
         now = time.time()
         with rooms_lock:
             stale = [rid for rid, r in rooms.items()
-                     if now - r.get('created_at', now) > ROOM_TTL]
+                     if now > r.get('expires_at', r.get('created_at', now) + ROOM_TTL)]
             for rid in stale:
                 rooms.pop(rid, None)
             # 사라진 방을 가리키는 소켓 매핑도 함께 정리
@@ -128,7 +130,10 @@ def run_timer(room_id, my_epoch):
                 return
             if room['status'] != 'running':
                 return
-            if room['remaining'] > 0:
+            if room.get('end_at'):
+                # ['특정 시각까지' 모드] 마감 시각 기준으로 매초 다시 계산 → 장기간에도 오차 없음
+                room['remaining'] = max(0, int(round(room['end_at'] - time.time())))
+            elif room['remaining'] > 0:
                 room['remaining'] -= 1
             # [예약 메시지] 남은시간이 예약 시각 이하가 되면 자동 발동(각 1회)
             for item in room['schedule']:
@@ -160,6 +165,7 @@ def _snapshot(room):
         'viewers': room['viewers'],
         'message': room.get('message', ''),   # 화면에 띄운 메시지(없으면 빈 값)
         'start_at': room.get('start_at'),      # 예약 시작 시각(대기 화면 카운트다운용)
+        'name': room.get('name', ''),          # 타이머 이름(참가자 화면 표시)
     }
 
 
@@ -244,19 +250,36 @@ def home():
 @app.route('/create', methods=['POST'])
 def create():
     data = request.get_json(force=True, silent=True) or {}
-    try:
-        minutes = int(data.get('minutes', 5))
-        seconds = int(data.get('seconds', 0))
-    except (ValueError, TypeError):
-        return jsonify({'error': '시간 형식이 올바르지 않습니다.'}), 400
+    # 타이머 이름(모든 참가자 화면에 표시). 구버전·MCP 호환을 위해 usage 값도 이름으로 받는다.
+    name = str(data.get('name') or data.get('usage') or '').strip()[:30]
 
-    total = minutes * 60 + seconds
-    if total <= 0:
-        return jsonify({'error': '1초 이상으로 설정해주세요.'}), 400
-    if total > 24 * 3600:
-        return jsonify({'error': '최대 24시간까지 설정 가능합니다.'}), 400
+    end_at = None
+    if data.get('until_ms') is not None:
+        # [모드2] '특정 시각까지' — 절대 시각(에폭 ms)을 받아 남은 시간을 계산, 즉시 시작
+        try:
+            end_at = float(data.get('until_ms')) / 1000.0
+        except (ValueError, TypeError):
+            return jsonify({'error': '시각 형식이 올바르지 않습니다.'}), 400
+        total = int(round(end_at - time.time()))
+        if total < 10:
+            return jsonify({'error': '이미 지났거나 10초 이내인 시각입니다.'}), 400
+        if total > MAX_UNTIL:
+            return jsonify({'error': '최대 90일 뒤까지 설정할 수 있습니다.'}), 400
+    else:
+        # [모드1] 기간으로 설정 — 일/시/분/초
+        try:
+            days = int(data.get('days', 0) or 0)
+            hours = int(data.get('hours', 0) or 0)
+            minutes = int(data.get('minutes', 0) or 0)
+            seconds = int(data.get('seconds', 0) or 0)
+        except (ValueError, TypeError):
+            return jsonify({'error': '시간 형식이 올바르지 않습니다.'}), 400
+        total = days * 86400 + hours * 3600 + minutes * 60 + seconds
+        if total <= 0:
+            return jsonify({'error': '1초 이상으로 설정해주세요.'}), 400
+        if total > MAX_DURATION:
+            return jsonify({'error': '최대 30일까지 설정 가능합니다.'}), 400
 
-    usage = str(data.get('usage', '미선택'))[:20]
     room_id = uuid.uuid4().hex[:6]
     control_token = uuid.uuid4().hex
 
@@ -267,15 +290,20 @@ def create():
         rooms[room_id] = {
             'control_token': control_token,
             'duration': total, 'remaining': total,
-            'status': 'idle', 'usage': usage,
+            'status': 'running' if end_at else 'idle',   # 마감형은 만들자마자 진행
+            'name': name,               # 타이머 이름(참가자 화면 표시)
             'viewers': 0,
-            'epoch': 0,                 # [버그①수정] 타이머 작업 세대번호
+            'epoch': 1 if end_at else 0,   # [버그①수정] 타이머 작업 세대번호
             'created_at': time.time(),  # [남용방지] 자동 정리 기준 시각
+            'expires_at': time.time() + max(ROOM_TTL, total + 3600),  # 장기 타이머는 끝까지 유지
             'message': '',              # 실시간 메시지(공대장 지시 등). 컨트롤러만 변경 가능
             'schedule': [],             # 예약 메시지 [{at:남은초, text, fired}]. 컨트롤러만 변경
             'start_at': None,           # 예약 시작 시각(Unix타임스탬프). None=예약 없음
+            'end_at': end_at,           # '특정 시각까지' 모드의 마감 시각(에폭 초). None=기간 모드
             'poll': None,               # 진행 중 투표(없으면 None). 컨트롤러만 생성/제어
         }
+    if end_at:   # 마감형 타이머는 생성 즉시 카운트다운 시작
+        threading.Thread(target=run_timer, args=(room_id, 1), daemon=True).start()
 
     # 뷰어용 절대주소(폰/외부에서 바로 열림). 로컬=LAN IP, 배포=공개 도메인으로 자동 결정.
     base = public_base_url()
@@ -383,11 +411,13 @@ def on_control(data):
         elif action == 'pause':
             if room['status'] == 'running':
                 room['status'] = 'paused'
+                room['end_at'] = None   # 마감형은 일시정지 순간 일반(남은시간) 타이머로 전환
         elif action == 'reset':
             room['status'] = 'idle'
             room['remaining'] = room['duration']
             room['epoch'] += 1      # 돌고 있던 옛 작업도 함께 종료시킴
             room['start_at'] = None # 예약 시작도 함께 취소
+            room['end_at'] = None   # 마감형 모드도 해제
             for item in room['schedule']:
                 item['fired'] = False   # 예약 메시지도 다시 발동 가능하게 초기화
         elif action == 'adjust':
@@ -395,7 +425,12 @@ def on_control(data):
                 delta = int(data.get('delta', 0))
             except (ValueError, TypeError):
                 delta = 0
-            room['remaining'] = max(0, min(24 * 3600, room['remaining'] + delta))
+            if room.get('end_at'):
+                # 마감형: 마감 시각 자체를 미루거나 당긴다
+                room['end_at'] += delta
+                room['remaining'] = max(0, int(round(room['end_at'] - time.time())))
+            else:
+                room['remaining'] = max(0, min(MAX_DURATION, room['remaining'] + delta))
         elif action == 'message':
             # [보안] 길이만 제한. 화면에는 textContent 로 넣어 XSS 를 원천 차단한다.
             room['message'] = str(data.get('text', ''))[:200]
@@ -408,7 +443,7 @@ def on_control(data):
                 at = int(data.get('at', 0))
             except (ValueError, TypeError):
                 at = 0
-            at = max(0, min(24 * 3600, at))
+            at = max(0, min(MAX_DURATION, at))
             text = str(data.get('text', ''))[:200]
             if text and at > 0:
                 room['schedule'].append({'at': at, 'text': text, 'fired': False})
@@ -441,6 +476,14 @@ def on_control(data):
             if room['status'] == 'scheduled':
                 room['status'] = 'idle'
                 room['start_at'] = None
+        elif action == 'end_room':
+            # [관리자] 타이머 완전 종료: 방을 삭제하고 전원에게 알린다. 링크도 만료됨.
+            rooms.pop(room_id, None)
+            for s in [s for s, rid in sid_to_room.items() if rid == room_id]:
+                sid_to_room.pop(s, None)
+            socketio.emit('room_closed',
+                          {'message': '진행자가 타이머를 종료했습니다.'}, room=room_id)
+            return
         else:
             emit('error_msg', {'message': '알 수 없는 명령입니다.'})
             return
@@ -683,28 +726,74 @@ button { width:100%;padding:14px;margin-top:24px;border:none;border-radius:10px;
 .qr-wrap { margin-top:12px;text-align:center;background:#fff;border-radius:10px;padding:16px; }
 .qr-wrap img { width:190px;height:190px;display:block;margin:0 auto; }
 .qr-hint { font-size:12px;color:#0f172a;margin-top:10px;line-height:1.45; }
+.mode-tabs { display:flex;gap:8px;margin-top:16px; }
+.mode-tabs .tab { flex:1;width:auto;margin-top:0;padding:10px;border-radius:10px;
+ border:1px solid #334155;background:#0f172a;color:#94a3b8;font-size:14px;font-weight:600;cursor:pointer; }
+.mode-tabs .tab.on { background:#3b82f6;color:#fff;border-color:transparent; }
+#durBox .time-row { margin-top:10px; }
+.hint { font-size:11px;color:#64748b;margin-top:8px;line-height:1.55; }
+.cal { margin-top:10px;background:#0f172a;border:1px solid #334155;border-radius:10px;padding:10px; }
+.cal-head { display:flex;justify-content:space-between;align-items:center;margin-bottom:8px; }
+.cal-title { font-size:14px;font-weight:700;color:#e2e8f0; }
+.cal-nav { width:auto;margin:0;padding:4px 12px;background:#1e293b;border:1px solid #334155;
+ border-radius:8px;color:#e2e8f0;font-size:13px;cursor:pointer; }
+.cal-grid { display:grid;grid-template-columns:repeat(7,1fr);gap:2px; }
+.cal-grid .dow { text-align:center;font-size:11px;color:#64748b;padding:4px 0; }
+.cal-grid .day { width:auto;margin:0;padding:8px 0;text-align:center;font-size:13px;
+ border-radius:8px;background:transparent;border:none;color:#e2e8f0;cursor:pointer; }
+.cal-grid .day:hover { background:#1e293b; }
+.cal-grid .day.past { color:#3b4a63;cursor:default; }
+.cal-grid .day.today { border:1px solid #3b82f6; }
+.cal-grid .day.sel { background:#3b82f6;color:#fff;font-weight:700; }
+.pick-label { font-size:12px;color:#94a3b8;margin-top:12px; }
+.ampm-row { display:flex;gap:6px;margin-top:6px; }
+.pick { width:auto;flex:1;margin:0;padding:9px 0;font-size:14px;border-radius:8px;
+ background:#0f172a;border:1px solid #334155;color:#94a3b8;cursor:pointer;font-weight:600; }
+.pick.on { background:#3b82f6;border-color:transparent;color:#fff; }
+.hour-grid, .min-grid { display:grid;grid-template-columns:repeat(6,1fr);gap:6px;margin-top:6px; }
+.until-summary { margin-top:12px;font-size:13px;color:#7dd3fc;text-align:center;
+ background:#0f172a;border:1px solid #334155;border-radius:10px;padding:10px;line-height:1.5; }
 </style></head><body>
 <div class="card">
  <h1>모두의 타이머</h1>
  <div class="sub">링크·QR 하나로 다같이 보는 실시간 타이머</div>
- <label>시간 설정</label>
- <div class="time-row">
-  <div><input type="number" id="minutes" value="5" min="0" max="1440">
-   <div style="font-size:11px;color:#64748b;text-align:center;margin-top:4px;">분</div></div>
-  <div><input type="number" id="seconds" value="0" min="0" max="59">
-   <div style="font-size:11px;color:#64748b;text-align:center;margin-top:4px;">초</div></div>
+ <label>타이머 이름 <span style="color:#64748b;">(선택 — 참가자 화면에 표시됩니다)</span></label>
+ <input type="text" id="tname" maxlength="30" placeholder="예: 3분 스피치, 프로젝트 마감">
+ <div class="mode-tabs">
+  <button type="button" class="tab on" id="tabDur" onclick="setMode('dur')">⏱ 시간으로 설정</button>
+  <button type="button" class="tab" id="tabUntil" onclick="setMode('until')">📅 특정 시각까지</button>
  </div>
- <label>어디에 쓰시나요? <span style="color:#64748b;">(선택)</span></label>
- <select id="usage">
-  <option value="미선택">선택 안 함</option>
-  <option value="발표">발표 / 프레젠테이션</option>
-  <option value="회의">회의 / 미팅</option>
-  <option value="수업">수업 / 강의</option>
-  <option value="면접심사">면접 / 심사</option>
-  <option value="행사">행사 / 공연</option>
-  <option value="운동">운동 / 트레이닝</option>
-  <option value="기타">기타</option>
- </select>
+ <div id="durBox">
+  <div class="time-row">
+   <div><input type="number" id="days" value="0" min="0" max="30">
+    <div style="font-size:11px;color:#64748b;text-align:center;margin-top:4px;">일</div></div>
+   <div><input type="number" id="hours" value="0" min="0" max="23">
+    <div style="font-size:11px;color:#64748b;text-align:center;margin-top:4px;">시간</div></div>
+   <div><input type="number" id="minutes" value="5" min="0" max="59">
+    <div style="font-size:11px;color:#64748b;text-align:center;margin-top:4px;">분</div></div>
+   <div><input type="number" id="seconds" value="0" min="0" max="59">
+    <div style="font-size:11px;color:#64748b;text-align:center;margin-top:4px;">초</div></div>
+  </div>
+ </div>
+ <div id="untilBox" style="display:none;">
+  <div class="cal">
+   <div class="cal-head">
+    <button type="button" class="cal-nav" onclick="calMove(-1)">◀</button>
+    <span class="cal-title" id="calTitle"></span>
+    <button type="button" class="cal-nav" onclick="calMove(1)">▶</button>
+   </div>
+   <div class="cal-grid" id="calGrid"></div>
+  </div>
+  <div class="pick-label">시간 선택</div>
+  <div class="ampm-row">
+   <button type="button" class="pick" id="amBtn" onclick="pickAmPm('am')">오전</button>
+   <button type="button" class="pick" id="pmBtn" onclick="pickAmPm('pm')">오후</button>
+  </div>
+  <div class="hour-grid" id="hourGrid"></div>
+  <div class="min-grid" id="minGrid"></div>
+  <div class="until-summary" id="untilSummary">날짜와 시간을 선택하세요</div>
+  <div class="hint">지정한 시각까지 남은 시간을 자동 계산해 <b>바로 카운트다운을 시작</b>합니다.</div>
+ </div>
  <button onclick="createTimer()">타이머 만들기</button>
  <div class="result" id="result">
   <div class="link-box">
@@ -728,13 +817,31 @@ button { width:100%;padding:14px;margin-top:24px;border:none;border-radius:10px;
 </div>
 <script>
 let controlPath='';
+let makeMode='dur';
+function setMode(m){
+ makeMode=m;
+ document.getElementById('tabDur').classList.toggle('on', m==='dur');
+ document.getElementById('tabUntil').classList.toggle('on', m==='until');
+ document.getElementById('durBox').style.display=(m==='dur')?'block':'none';
+ document.getElementById('untilBox').style.display=(m==='until')?'block':'none';
+}
 async function createTimer(){
- const minutes=document.getElementById('minutes').value;
- const seconds=document.getElementById('seconds').value;
- const usage=document.getElementById('usage').value;
+ const name=document.getElementById('tname').value.trim();
+ let body={name};
+ if(makeMode==='until'){
+  const t=untilMs();
+  if(t===null){alert('날짜와 시간(오전/오후·시·분)을 모두 선택해주세요.');return;}
+  if(!(t>Date.now()+10000)){alert('이미 지났거나 너무 가까운 시각입니다.');return;}
+  body.until_ms=t;
+ } else {
+  body.days=document.getElementById('days').value;
+  body.hours=document.getElementById('hours').value;
+  body.minutes=document.getElementById('minutes').value;
+  body.seconds=document.getElementById('seconds').value;
+ }
  const res=await fetch('/create',{method:'POST',
   headers:{'Content-Type':'application/json'},
-  body:JSON.stringify({minutes,seconds,usage})});
+  body:JSON.stringify(body)});
  const data=await res.json();
  if(data.error){alert(data.error);return;}
  const origin=window.location.origin;
@@ -750,6 +857,78 @@ async function createTimer(){
 function copy(id){const el=document.getElementById(id);el.select();
  document.execCommand('copy');alert('복사되었습니다!');}
 function openControl(){if(controlPath)window.location.href=controlPath;}
+// --- '특정 시각까지' 선택기: 캘린더 + 오전/오후 토글 + 시·분 버튼 ---
+const _today=new Date(); _today.setHours(0,0,0,0);
+let calY=_today.getFullYear(), calM=_today.getMonth();
+let selD=new Date(_today);            // 날짜 (기본: 오늘)
+let selAmPm=null, selHour=null, selMin=0;   // 분은 00분이 기본 선택
+function calMove(d){
+ calM+=d; if(calM<0){calM=11;calY--;} if(calM>11){calM=0;calY++;}
+ renderCal();
+}
+function renderCal(){
+ document.getElementById('calTitle').textContent=calY+'년 '+(calM+1)+'월';
+ const g=document.getElementById('calGrid'); g.textContent='';
+ ['일','월','화','수','목','금','토'].forEach(d=>{const e=document.createElement('div');e.className='dow';e.textContent=d;g.appendChild(e);});
+ const first=new Date(calY,calM,1);
+ for(let i=0;i<first.getDay();i++){ g.appendChild(document.createElement('div')); }
+ const last=new Date(calY,calM+1,0).getDate();
+ for(let d=1;d<=last;d++){
+  const dt=new Date(calY,calM,d);
+  const cell=document.createElement('button'); cell.type='button'; cell.textContent=d;
+  let cls='day';
+  if(dt<_today) cls+=' past';
+  if(dt.getTime()===_today.getTime()) cls+=' today';
+  if(selD&&dt.getTime()===selD.getTime()) cls+=' sel';
+  cell.className=cls;
+  if(dt>=_today) cell.onclick=()=>{ selD=dt; renderCal(); updateSummary(); };
+  g.appendChild(cell);
+ }
+}
+function pickAmPm(v){
+ selAmPm=v;
+ document.getElementById('amBtn').classList.toggle('on',v==='am');
+ document.getElementById('pmBtn').classList.toggle('on',v==='pm');
+ updateSummary();
+}
+function buildTimeGrids(){
+ const hg=document.getElementById('hourGrid');
+ for(let h=1;h<=12;h++){
+  const b=document.createElement('button'); b.type='button'; b.className='pick'; b.textContent=h+'시';
+  b.onclick=()=>{ selHour=h; Array.from(hg.children).forEach(x=>x.classList.remove('on')); b.classList.add('on'); updateSummary(); };
+  hg.appendChild(b);
+ }
+ const mg=document.getElementById('minGrid');
+ for(let m=0;m<60;m+=5){
+  const b=document.createElement('button'); b.type='button'; b.className='pick'; b.textContent=String(m).padStart(2,'0')+'분';
+  if(m===0) b.classList.add('on');
+  b.onclick=()=>{ selMin=m; Array.from(mg.children).forEach(x=>x.classList.remove('on')); b.classList.add('on'); updateSummary(); };
+  mg.appendChild(b);
+ }
+}
+function untilMs(){
+ if(!selD||selAmPm===null||selHour===null||selMin===null) return null;
+ const h24=(selHour%12)+(selAmPm==='pm'?12:0);   // 오전12=0시, 오후12=12시
+ const d=new Date(selD); d.setHours(h24,selMin,0,0);
+ return d.getTime();
+}
+function updateSummary(){
+ const el=document.getElementById('untilSummary');
+ const t=untilMs();
+ if(t===null){ el.textContent='날짜와 시간을 선택하세요'; return; }
+ const d=new Date(t);
+ const yoil=['일','월','화','수','목','금','토'][d.getDay()];
+ const diff=t-Date.now();
+ let rel;
+ if(diff<=0){ rel='⚠️ 이미 지난 시각입니다'; }
+ else{
+  const dd=Math.floor(diff/86400000), hh=Math.floor(diff%86400000/3600000), mm=Math.floor(diff%3600000/60000);
+  rel='지금부터 '+(dd?dd+'일 ':'')+(hh?hh+'시간 ':'')+mm+'분 뒤';
+ }
+ el.textContent=(d.getMonth()+1)+'월 '+d.getDate()+'일('+yoil+') '
+   +(selAmPm==='am'?'오전':'오후')+' '+selHour+':'+String(selMin).padStart(2,'0')+' 까지 · '+rel;
+}
+renderCal(); buildTimeGrids();
 </script></body></html>
 '''
 
@@ -761,6 +940,7 @@ CONTROLS_HTML = '''
   <button class="btn primary" onclick="ctrl('start')">시작</button>
   <button class="btn" onclick="ctrl('pause')">일시정지</button>
   <button class="btn" onclick="ctrl('reset')">리셋</button>
+  <button class="btn danger" onclick="endRoom()">타이머 종료</button>
  </div>
 </div>
 <div class="panel">
@@ -935,6 +1115,11 @@ body.done .timer { animation:blink 1s steps(1) infinite; }
  background:#22c55e;color:#052e16;font-size:22px;font-weight:800;cursor:pointer; }
 .race-btn:disabled { opacity:.6;cursor:default; }
 .race-done { margin-top:10px;text-align:center;font-size:20px;font-weight:800;color:#7dd3fc; }
+.btn.danger { background:#7f1d1d;color:#fecaca;border-color:transparent; }
+.tname { font-size:clamp(15px,2.6vw,24px);font-weight:700;color:#7dd3fc;
+ text-align:center;word-break:keep-all; }
+.stage.view .timer.long { font-size:clamp(44px,11vw,160px); }
+.stage.ctrl .timer.long { font-size:clamp(28px,6.5vw,72px); }
 </style></head><body>
 <div class="stage {{STAGE}}">
 <div class="topbar">
@@ -945,6 +1130,7 @@ body.done .timer { animation:blink 1s steps(1) infinite; }
   <button class="badge" onclick="toggleFullscreen()">⛶ 전체화면</button>
  </div>
 </div>
+<div class="tname" id="roomName" style="display:none;"></div>
 <div class="msg-box" id="msgBox"></div>
 <div class="timer" id="timer">--:--</div>
 <div class="status-text" id="statusText">연결 중...</div>
@@ -1010,10 +1196,19 @@ socket.on('poll_you',(d)=>{ myChoice=d.choice; if(d.rank) myRank=d.rank; if(last
 socket.on('state',render);
 socket.on('tick',render);
 socket.on('finished',render);
+socket.on('room_closed',(d)=>{
+ stopScheduledView();
+ timerEl.textContent='--:--';
+ statusEl.textContent=(d&&d.message)||'타이머가 종료되었습니다.';
+ document.body.className='';
+ setTimeout(()=>{ location.href='/'; }, 4000);   // 잠시 후 홈으로 이동
+});
 socket.on('message',(d)=>{ showMessage(d.message); if(d.message) messageBeep(); });
 socket.on('error_msg',(d)=>{ statusEl.textContent='주의: '+d.message; });
 function render(s){
  if(s.viewers!==undefined) viewerEl.textContent=s.viewers;
+ if(s.name!==undefined){ const n=document.getElementById('roomName');
+  if(n){ n.textContent=s.name; n.style.display=s.name?'block':'none'; } }
  if(s.message!==undefined) showMessage(s.message);
  if(s.status==='scheduled'){ startScheduledView(s.start_at); return; }
  stopScheduledView();
@@ -1032,9 +1227,16 @@ function render(s){
  }
 }
 function fmt(total){
- const h=Math.floor(total/3600),m=Math.floor((total%3600)/60),s=total%60;
  const pad=(n)=>String(n).padStart(2,'0');
+ const d=Math.floor(total/86400),h=Math.floor((total%86400)/3600),
+       m=Math.floor((total%3600)/60),s=total%60;
+ if(timerEl) timerEl.classList.toggle('long', total>=86400);  // 하루 이상이면 글자 축소
+ if(d>0) return d+'일 '+pad(h)+':'+pad(m)+':'+pad(s);
  return h>0?`${pad(h)}:${pad(m)}:${pad(s)}`:`${pad(m)}:${pad(s)}`;
+}
+function endRoom(){
+ if(confirm('타이머를 완전히 종료할까요?\n모든 참가자의 화면이 닫히고 링크도 만료됩니다.'))
+  ctrl('end_room');
 }
 function ctrl(action){ socket.emit('control',{room_id:ROOM_ID,token:TOKEN,action}); }
 function adjust(delta){ socket.emit('control',{room_id:ROOM_ID,token:TOKEN,action:'adjust',delta}); }
